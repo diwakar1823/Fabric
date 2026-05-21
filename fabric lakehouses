@@ -1,0 +1,151 @@
+Here's the PySpark code for your MS Fabric notebook:
+
+```python
+# Cell 1: Install and import required libraries
+%pip install semantic-link-labs -q
+
+import sempy_labs as labs
+import sempy.fabric as fabric
+from pyspark.sql import SparkSession
+import pandas as pd
+import warnings
+warnings.filterwarnings('ignore')
+
+spark = SparkSession.builder.getOrCreate()
+```
+
+```python
+# Cell 2: List all lakehouses in the workspace
+workspace_id = fabric.get_workspace_id()
+print(f"Workspace ID: {workspace_id}")
+
+# Get all lakehouses
+lakehouses_df = labs.list_lakehouses(workspace=workspace_id)
+print(f"Total Lakehouses found: {len(lakehouses_df)}")
+print(lakehouses_df[['Lakehouse Name', 'Lakehouse ID']].to_string())
+```
+
+```python
+# Cell 3: Check access to each lakehouse
+
+def check_lakehouse_access(lakehouse_name, lakehouse_id, workspace_id):
+    """
+    Try to read one table from a lakehouse.
+    Handles both:
+      - Flat structure:   Tables/table_name/
+      - Schema structure: Tables/schema_name/table_name/
+    Returns 'Yes' if readable, 'No' otherwise.
+    """
+    try:
+        # Build the base ABFS path for this lakehouse
+        base_path = (
+            f"abfss://{workspace_id}@onelake.dfs.fabric.microsoft.com"
+            f"/{lakehouse_id}/Tables"
+        )
+
+        # List contents of the Tables folder
+        tables_dir = dbutils.fs.ls(base_path)
+
+        if not tables_dir:
+            return "No", "Tables folder is empty"
+
+        first_entry = tables_dir[0]
+
+        # Check if first entry is a schema folder (contains subfolders) or a table folder (contains parquet)
+        sub_entries = dbutils.fs.ls(first_entry.path)
+
+        # Determine if it's schema-based (sub_entries are folders) or flat (sub_entries are files/parquet)
+        has_parquet = any(
+            e.name.endswith('.parquet') or e.name.startswith('part-')
+            for e in sub_entries
+        )
+
+        if has_parquet:
+            # Flat structure — first_entry is a table folder
+            table_path = first_entry.path
+        else:
+            # Schema-based structure — go one level deeper
+            schema_entries = dbutils.fs.ls(first_entry.path)
+            if not schema_entries:
+                return "No", "Schema folder is empty"
+            table_path = schema_entries[0].path
+
+        # Try reading the table
+        df = spark.read.format("delta").load(table_path)
+        df.limit(1).collect()  # Trigger actual read
+        return "Yes", f"Read OK: {table_path.split('/')[-2]}"
+
+    except Exception as e:
+        err = str(e)
+        if "AuthorizationPermissionMismatch" in err or "403" in err:
+            return "No", "Access Denied (403)"
+        elif "FileNotFoundException" in err or "404" in err:
+            return "No", "Tables folder not found"
+        elif "delta" in err.lower():
+            # Try reading as parquet fallback
+            try:
+                df = spark.read.parquet(table_path)
+                df.limit(1).collect()
+                return "Yes", "Read OK (parquet fallback)"
+            except:
+                return "No", f"Delta read failed: {err[:80]}"
+        else:
+            return "No", f"Error: {err[:100]}"
+
+
+# Run access check for every lakehouse
+results = []
+
+for _, row in lakehouses_df.iterrows():
+    lakehouse_name = row['Lakehouse Name']
+    lakehouse_id   = row['Lakehouse ID']
+
+    print(f"Checking: {lakehouse_name} ...", end=" ")
+    access, reason = check_lakehouse_access(lakehouse_name, lakehouse_id, workspace_id)
+    print(f"{access}  ({reason})")
+
+    results.append({
+        "Lakehouse Name": lakehouse_name,
+        "Access"        : access,
+        "Reason"        : reason       # optional debug column
+    })
+```
+
+```python
+# Cell 4: Display final tabular output
+
+result_df = pd.DataFrame(results)
+
+# ── Clean output (2 columns only) ──────────────────────────────
+final_df = result_df[["Lakehouse Name", "Access"]]
+
+print("\n========== LAKEHOUSE ACCESS REPORT ==========")
+print(final_df.to_string(index=False))
+print("=" * 45)
+
+# ── Render as a nice table in the notebook ─────────────────────
+display(result_df)   # includes Reason column for debugging
+```
+
+---
+
+### How it works
+
+| Step | What happens |
+|------|-------------|
+| **List** | `sempy_labs.list_lakehouses()` pulls every lakehouse in your workspace |
+| **Locate tables** | Uses `dbutils.fs.ls()` on the OneLake ABFS path to find the Tables folder |
+| **Schema detection** | Checks if the first folder contains parquet files (flat) or more folders (schema-based), and drills in accordingly |
+| **Read test** | Does `spark.read.format("delta").load(...).limit(1).collect()` — the lightest possible read |
+| **Access decision** | `Yes` if the read succeeds, `No` on any 403 / FileNotFound / exception |
+
+### Output
+```
+ Lakehouse Name    Access
+───────────────   ──────
+ Sales_LH          Yes
+ Finance_LH        No
+ Marketing_LH      Yes
+```
+
+> **Tip:** The `Reason` column in the `display()` output helps you distinguish between *access denied* vs *empty lakehouse* vs *no delta tables*, without you having to dig through logs.
