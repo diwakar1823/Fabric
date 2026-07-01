@@ -1,0 +1,10 @@
+order_id,date,region,product,quantity,unit_price,revenue
+1000,2024-01-01,South,Laptop,1,1170.68,1170.68
+1000,2024-01-01,South,Mouse,3,25.41,76.23
+1001,2024-01-01,South,Mouse,4,24.59,98.36
+1002,2024-01-01,South,Tablet,4,455.91,1823.64
+1003,2024-01-01,North,Headphones,1,81.23,81.23
+1004,2024-01-01,West,Monitor,1,222.49,222.49
+1005,2024-01-01,South,Printer,2,141.14,282.28
+1005,2024-01-01,South,Headphones,3,80.96,242.88
+1006,2024-01-01,South,Headphones,2,77.96,155.92
