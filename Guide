@@ -1,0 +1,498 @@
+to_email = "Sanjay@company.com"
+cc_email = ""
+
+pipeline_name = "Test Pipeline"
+pipeline_run_id = "N/A"
+pipeline_status = "Succeeded"
+
+pipeline_message = "No pipeline message was provided."
+failed_activity_name = "N/A"
+
+environment = "DEV"
+
+import time
+import html
+import traceback
+import requests
+import notebookutils
+
+from azure.keyvault.secrets import SecretClient
+from azure.core.credentials import AccessToken, TokenCredential
+
+
+class FabricCredential(TokenCredential):
+    def get_token(self, *scopes, **kwargs):
+        token = notebookutils.credentials.getToken("https://vault.azure.net")
+        return AccessToken(token, int(time.time()) + 3600)
+
+kv_url = "https://kv-for-data.vault.azure.net/"
+
+try:
+    kv_client = SecretClient(
+        vault_url=kv_url,
+        credential=FabricCredential()
+    )
+
+    print("Connected to Key Vault successfully.")
+
+    tenant_id = kv_client.get_secret("sp-tenant-id").value
+    client_id = kv_client.get_secret("sp-client-id").value
+    client_secret = kv_client.get_secret("sp-client-secret").value
+    sender_mailbox = kv_client.get_secret("sender-mailbox").value
+
+    print("Secrets loaded successfully from Key Vault.")
+    print(f"Sender mailbox loaded: {sender_mailbox}")
+
+except Exception as ex:
+    print("Failed to connect to Key Vault or load secrets.")
+    print(str(ex))
+    raise
+
+
+def get_graph_token(tenant_id, client_id, client_secret):
+    token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+
+    token_body = {
+        "grant_type": "client_credentials",
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "scope": "https://graph.microsoft.com/.default"
+    }
+
+    response = requests.post(token_url, data=token_body, timeout=30)
+
+    if response.status_code != 200:
+        raise Exception(
+            f"Token generation failed. "
+            f"Status: {response.status_code}, Response: {response.text}"
+        )
+
+    token_response = response.json()
+
+    if "access_token" not in token_response:
+        raise Exception(f"Access token not found in token response: {token_response}")
+
+    return token_response["access_token"]
+
+
+graph_token = get_graph_token(
+    tenant_id=tenant_id,
+    client_id=client_id,
+    client_secret=client_secret
+)
+
+print("Graph token generated successfully.")
+
+
+
+def normalize_pipeline_status(status):
+    normalized_status = str(status).strip().lower()
+
+    success_values = ["success", "succeeded", "completed"]
+    failure_values = ["fail", "failed", "failure", "error"]
+
+    if normalized_status in success_values:
+        return True, "Succeeded", "✅"
+
+    if normalized_status in failure_values:
+        return False, "Failed", "❌"
+
+    return False, str(status), "⚠️"
+
+
+is_success, status_label, status_icon = normalize_pipeline_status(pipeline_status)
+
+safe_environment = html.escape(str(environment))
+safe_pipeline_name = html.escape(str(pipeline_name))
+safe_pipeline_run_id = html.escape(str(pipeline_run_id))
+safe_status_label = html.escape(str(status_label))
+safe_pipeline_message = html.escape(str(pipeline_message))
+safe_failed_activity_name = html.escape(str(failed_activity_name))
+
+subject = f"{status_icon} [{safe_environment}] Fabric Pipeline {safe_status_label}: {safe_pipeline_name}"
+
+failed_activity_row = ""
+if not is_success:
+    failed_activity_row = f"""
+    <tr>
+        <td><b>Failed Activity</b></td>
+        <td>{safe_failed_activity_name}</td>
+    </tr>
+    """
+
+html_body = f"""
+<html>
+<body>
+    <p>Hello,</p>
+
+    <p>Please find the Fabric pipeline execution status below:</p>
+
+    <table border="1" cellpadding="6" cellspacing="0" style="border-collapse: collapse;">
+        <tr>
+            <td><b>Environment</b></td>
+            <td>{safe_environment}</td>
+        </tr>
+        <tr>
+            <td><b>Pipeline Name</b></td>
+            <td>{safe_pipeline_name}</td>
+        </tr>
+        <tr>
+            <td><b>Pipeline Run ID</b></td>
+            <td>{safe_pipeline_run_id}</td>
+        </tr>
+        <tr>
+            <td><b>Status</b></td>
+            <td>{status_icon} {safe_status_label}</td>
+        </tr>
+        {failed_activity_row}
+        <tr>
+            <td><b>Message</b></td>
+            <td>{safe_pipeline_message}</td>
+        </tr>
+    </table>
+
+    <p>Regards,<br>Fabric Pipeline Alert</p>
+</body>
+</html>
+"""
+
+print("Email content created successfully.")
+
+
+
+def build_recipients(email_string):
+    if not email_string:
+        return []
+
+    return [
+        {
+            "emailAddress": {
+                "address": email.strip()
+            }
+        }
+        for email in email_string.split(",")
+        if email.strip()
+    ]
+
+
+def send_email(access_token, sender_mailbox, to_email, cc_email, subject, html_body):
+    send_mail_url = f"https://graph.microsoft.com/v1.0/users/{sender_mailbox}/sendMail"
+
+    to_recipients = build_recipients(to_email)
+    cc_recipients = build_recipients(cc_email)
+
+    if not to_recipients:
+        raise Exception("No valid To recipients were provided.")
+
+    message = {
+        "subject": subject,
+        "body": {
+            "contentType": "HTML",
+            "content": html_body
+        },
+        "toRecipients": to_recipients
+    }
+
+    if cc_recipients:
+        message["ccRecipients"] = cc_recipients
+
+    payload = {
+        "message": message,
+        "saveToSentItems": True
+    }
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+
+    response = requests.post(
+        send_mail_url,
+        headers=headers,
+        json=payload,
+        timeout=30
+    )
+
+    if response.status_code != 202:
+        raise Exception(
+            f"Email send failed. "
+            f"Status: {response.status_code}, Response: {response.text}"
+        )
+
+    return "Email submitted successfully."
+
+
+try:
+    result = send_email(
+        access_token=graph_token,
+        sender_mailbox=sender_mailbox,
+        to_email=to_email,
+        cc_email=cc_email,
+        subject=subject,
+        html_body=html_body
+    )
+
+    print(result)
+
+except Exception as ex:
+    print("Pipeline notification email failed.")
+    print(str(ex))
+    print(traceback.format_exc())
+    raise
+
+
+
+
+
+
+
+
+
+
+
+# Fabric notebook parameter cell
+# These default values can be overridden by Fabric pipeline Notebook activity.
+
+to_email = "Sanjay@company.com"
+cc_email = ""
+
+pipeline_name = "Test Pipeline"
+pipeline_run_id = "N/A"
+pipeline_status = "Succeeded"
+
+pipeline_message = "No pipeline message was provided."
+failed_activity_name = "N/A"
+
+environment = "DEV"
+
+
+
+import time
+import html
+import traceback
+import requests
+import notebookutils
+
+from azure.keyvault.secrets import SecretClient
+from azure.core.credentials import AccessToken, TokenCredential
+
+
+class FabricCredential(TokenCredential):
+    def get_token(self, *scopes, **kwargs):
+        token = notebookutils.credentials.getToken("https://vault.azure.net")
+        return AccessToken(token, int(time.time()) + 3600)
+
+
+kv_url = "https://kv-for-data.vault.azure.net/"
+
+try:
+    kv_client = SecretClient(
+        vault_url=kv_url,
+        credential=FabricCredential()
+    )
+
+    print("Connected to Key Vault successfully.")
+
+    tenant_id = kv_client.get_secret("sp-tenant-id").value
+    client_id = kv_client.get_secret("sp-client-id").value
+    client_secret = kv_client.get_secret("sp-client-secret").value
+    sender_mailbox = kv_client.get_secret("sender-mailbox").value
+
+    print("Secrets loaded successfully from Key Vault.")
+    print(f"Sender mailbox loaded: {sender_mailbox}")
+
+except Exception as ex:
+    print("Failed to connect to Key Vault or load secrets.")
+    print(str(ex))
+    raise
+
+
+def get_graph_token(tenant_id, client_id, client_secret):
+    token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+
+    token_body = {
+        "grant_type": "client_credentials",
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "scope": "https://graph.microsoft.com/.default"
+    }
+
+    response = requests.post(token_url, data=token_body, timeout=30)
+
+    if response.status_code != 200:
+        raise Exception(
+            f"Token generation failed. "
+            f"Status: {response.status_code}, Response: {response.text}"
+        )
+
+    token_response = response.json()
+
+    if "access_token" not in token_response:
+        raise Exception(f"Access token not found in token response: {token_response}")
+
+    return token_response["access_token"]
+
+
+graph_token = get_graph_token(
+    tenant_id=tenant_id,
+    client_id=client_id,
+    client_secret=client_secret
+)
+
+print("Graph token generated successfully.")
+
+
+def normalize_pipeline_status(status):
+    normalized_status = str(status).strip().lower()
+
+    success_values = ["success", "succeeded", "completed"]
+    failure_values = ["fail", "failed", "failure", "error"]
+
+    if normalized_status in success_values:
+        return True, "Succeeded", "✅"
+
+    if normalized_status in failure_values:
+        return False, "Failed", "❌"
+
+    return False, str(status), "⚠️"
+
+
+is_success, status_label, status_icon = normalize_pipeline_status(pipeline_status)
+
+safe_environment = html.escape(str(environment))
+safe_pipeline_name = html.escape(str(pipeline_name))
+safe_pipeline_run_id = html.escape(str(pipeline_run_id))
+safe_status_label = html.escape(str(status_label))
+safe_pipeline_message = html.escape(str(pipeline_message))
+safe_failed_activity_name = html.escape(str(failed_activity_name))
+
+subject = f"{status_icon} [{safe_environment}] Fabric Pipeline {safe_status_label}: {safe_pipeline_name}"
+
+failed_activity_row = ""
+if not is_success:
+    failed_activity_row = f"""
+    <tr>
+        <td><b>Failed Activity</b></td>
+        <td>{safe_failed_activity_name}</td>
+    </tr>
+    """
+
+html_body = f"""
+<html>
+<body>
+    <p>Hello,</p>
+
+    <p>Please find the Fabric pipeline execution status below:</p>
+
+    <table border="1" cellpadding="6" cellspacing="0" style="border-collapse: collapse;">
+        <tr>
+            <td><b>Environment</b></td>
+            <td>{safe_environment}</td>
+        </tr>
+        <tr>
+            <td><b>Pipeline Name</b></td>
+            <td>{safe_pipeline_name}</td>
+        </tr>
+        <tr>
+            <td><b>Pipeline Run ID</b></td>
+            <td>{safe_pipeline_run_id}</td>
+        </tr>
+        <tr>
+            <td><b>Status</b></td>
+            <td>{status_icon} {safe_status_label}</td>
+        </tr>
+        {failed_activity_row}
+        <tr>
+            <td><b>Message</b></td>
+            <td>{safe_pipeline_message}</td>
+        </tr>
+    </table>
+
+    <p>Regards,<br>Fabric Pipeline Alert</p>
+</body>
+</html>
+"""
+
+print("Email content created successfully.")
+
+
+def build_recipients(email_string):
+    if not email_string:
+        return []
+
+    return [
+        {
+            "emailAddress": {
+                "address": email.strip()
+            }
+        }
+        for email in email_string.split(",")
+        if email.strip()
+    ]
+
+
+def send_email(access_token, sender_mailbox, to_email, cc_email, subject, html_body):
+    send_mail_url = f"https://graph.microsoft.com/v1.0/users/{sender_mailbox}/sendMail"
+
+    to_recipients = build_recipients(to_email)
+    cc_recipients = build_recipients(cc_email)
+
+    if not to_recipients:
+        raise Exception("No valid To recipients were provided.")
+
+    message = {
+        "subject": subject,
+        "body": {
+            "contentType": "HTML",
+            "content": html_body
+        },
+        "toRecipients": to_recipients
+    }
+
+    if cc_recipients:
+        message["ccRecipients"] = cc_recipients
+
+    payload = {
+        "message": message,
+        "saveToSentItems": True
+    }
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+
+    response = requests.post(
+        send_mail_url,
+        headers=headers,
+        json=payload,
+        timeout=30
+    )
+
+    if response.status_code != 202:
+        raise Exception(
+            f"Email send failed. "
+            f"Status: {response.status_code}, Response: {response.text}"
+        )
+
+    return "Email submitted successfully."
+
+
+
+try:
+    result = send_email(
+        access_token=graph_token,
+        sender_mailbox=sender_mailbox,
+        to_email=to_email,
+        cc_email=cc_email,
+        subject=subject,
+        html_body=html_body
+    )
+
+    print(result)
+
+except Exception as ex:
+    print("Pipeline notification email failed.")
+    print(str(ex))
+    print(traceback.format_exc())
+    raise
